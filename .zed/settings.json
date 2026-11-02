@@ -1,0 +1,11 @@
+{
+  "languages": {
+    "Go": {
+      "format_on_save": "on",
+      "formatter": [
+        { "code_action": "source.organizeImports" },
+        { "language_server": { "name": "gopls" } }
+      ]
+    }
+  }
+}
