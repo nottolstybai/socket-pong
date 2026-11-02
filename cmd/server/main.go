@@ -1,12 +1,16 @@
 package main
 
 import (
+	"flag"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/nottolstybai/socket-pong/internal/protocol"
 )
+
+const maxMessageBytes = 1024
 
 var room = newRoom()
 
@@ -17,11 +21,11 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	conn.SetReadLimit(maxMessageBytes)
 
-	player, ok := room.Add(conn)
+	player, state, ok := room.Add(conn)
 	if !ok {
-		log.Printf("INFO: room is full")
-		conn.WriteMessage(
+		_ = conn.WriteMessage(
 			websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "room is full"),
 		)
@@ -29,74 +33,50 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer room.Remove(conn)
 
-	if err := player.WriteJSON(&protocol.Message{
-		Type: protocol.MessageWelcome,
-		Side: player.side,
-	}); err != nil {
-		log.Printf("INFO: player.WriteJSON(welcome): %v\n", err)
+	if err := player.writeNow(protocol.Message{Type: protocol.MessageWelcome, Side: player.side}); err != nil {
 		return
 	}
+	if err := player.writeNow(protocol.Message{Type: protocol.MessageState, State: &state}); err != nil {
+		return
+	}
+	go player.writeLoop()
 
-	state := room.Snapshot()
-	if err := player.WriteJSON(&protocol.Message{
-		Type:  protocol.MessageState,
-		State: &state,
-	}); err != nil {
-		log.Printf("INFO: player.WriteJSON(state): %v\n", err)
-		return
-	}
+	log.Printf("player joined: %s", player.side)
+	defer log.Printf("player left: %s", player.side)
 
 	for {
 		var msg protocol.Message
 		if err := conn.ReadJSON(&msg); err != nil {
-			if websocket.IsCloseError(
-				err,
-				websocket.CloseNormalClosure,
-				websocket.CloseGoingAway,
-			) {
-				log.Println("INFO: client disconnected")
-				return
-			}
-			log.Printf("ERROR: conn.ReadJSON: %v\n", err)
 			return
 		}
 
 		switch msg.Type {
-		case protocol.MessageMove:
-			switch msg.Direction {
-			case protocol.DirectionUp, protocol.DirectionDown, protocol.DirectionStop:
-				log.Printf("INFO: got cmd: %s", msg.Direction)
-				state, ok := room.Move(conn, msg.Direction)
-				if !ok {
-					return
-				}
-
-				room.Broadcast(protocol.Message{
-					Type:  protocol.MessageState,
-					State: &state,
-				})
-			default:
-				return
-			}
-		default:
-			log.Printf("ERROR: unknown message type: %s\n", msg.Type)
-			return
+		case protocol.MessagePaddle:
+			room.SetPaddle(player, msg.Y, msg.V)
+		case protocol.MessagePing:
+			room.Pong(player, msg.ClientTime)
+		case protocol.MessageRematch:
+			room.Rematch(player)
 		}
 	}
 }
 
 func main() {
+	addr := flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
+	flag.Parse()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler)
 
 	server := &http.Server{
-		Addr:    "127.0.0.1:8080",
-		Handler: mux,
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	go room.Run()
-
+	log.Printf("socket-pong listening on ws://%s/ws", *addr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		panic(err)
+		log.Fatal(err)
 	}
 }

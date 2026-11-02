@@ -2,71 +2,112 @@ package main
 
 import (
 	"log"
-	"maps"
-	"slices"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/nottolstybai/socket-pong/internal/protocol"
+	"github.com/nottolstybai/socket-pong/internal/sim"
 )
 
 const (
-	fieldHeight   = 12
-	paddleHeight  = 4
-	fieldWidth    = 40
-	frameInterval = 80 * time.Millisecond
-	winningScore  = 5
+	writeTimeout = 2 * time.Second
+	maxCatchUp   = 12 // physics ticks replayed after a stall, at most
 )
 
+// Player owns the outgoing side of a connection. A single goroutine writes to
+// the socket, so a slow client can never hold up the physics loop: if it falls
+// behind it simply skips to the newest snapshot.
 type Player struct {
-	conn    *websocket.Conn
-	side    string
-	writeMu sync.Mutex
+	conn *websocket.Conn
+	side string
+
+	states  chan protocol.State
+	control chan protocol.Message
+	done    chan struct{}
+	once    sync.Once
 }
 
-func (p *Player) WriteJSON(v any) error {
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-
-	return p.conn.WriteJSON(v)
+func newPlayer(conn *websocket.Conn, side string) *Player {
+	return &Player{
+		conn:    conn,
+		side:    side,
+		states:  make(chan protocol.State, 1),
+		control: make(chan protocol.Message, 16),
+		done:    make(chan struct{}),
+	}
 }
 
+func (p *Player) close() {
+	p.once.Do(func() { close(p.done) })
+}
+
+// writeNow writes directly to the socket. It may only be used before
+// writeLoop starts.
+func (p *Player) writeNow(msg protocol.Message) error {
+	_ = p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return p.conn.WriteJSON(msg)
+}
+
+func (p *Player) writeLoop() {
+	for {
+		var msg protocol.Message
+		select {
+		case <-p.done:
+			return
+		case msg = <-p.control:
+		case state := <-p.states:
+			msg = protocol.Message{Type: protocol.MessageState, State: &state}
+		}
+		if err := p.writeNow(msg); err != nil {
+			log.Printf("player %s: write: %v", p.side, err)
+			_ = p.conn.Close() // ends the read loop, which cleans up
+			return
+		}
+	}
+}
+
+// pushState replaces any snapshot the writer has not picked up yet.
+func (p *Player) pushState(state protocol.State) {
+	select {
+	case <-p.states:
+	default:
+	}
+	select {
+	case p.states <- state:
+	default:
+	}
+}
+
+func (p *Player) pushControl(msg protocol.Message) {
+	select {
+	case p.control <- msg:
+	default: // a dropped pong only delays clock synchronisation
+	}
+}
+
+// Room hosts the single match on this server.
 type Room struct {
-	mu         sync.Mutex
-	players    map[*websocket.Conn]*Player
-	leftY      int
-	rightY     int
-	ballX      int
-	ballY      int
-	ballDX     int
-	ballDY     int
-	leftScore  int
-	rightScore int
-	gameOver   bool
-	winner     string
-	started    bool
+	mu      sync.Mutex
+	players map[*websocket.Conn]*Player
+	game    *game
+	started time.Time
 }
 
 func newRoom() *Room {
 	return &Room{
-		mu:      sync.Mutex{},
 		players: make(map[*websocket.Conn]*Player, 2),
-		leftY:   (fieldHeight - paddleHeight) / 2,
-		rightY:  (fieldHeight - paddleHeight) / 2,
-		ballX:   fieldWidth / 2,
-		ballY:   fieldHeight / 2,
-		ballDX:  1,
-		ballDY:  1,
+		game:    newGame(),
+		started: time.Now(),
 	}
 }
 
-func (r *Room) Add(conn *websocket.Conn) (*Player, bool) {
+func (r *Room) Add(conn *websocket.Conn) (*Player, protocol.State, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if len(r.players) == 2 {
-		return nil, false
+		return nil, protocol.State{}, false
 	}
 
 	side := protocol.SideLeft
@@ -76,180 +117,82 @@ func (r *Room) Add(conn *websocket.Conn) (*Player, bool) {
 		}
 	}
 
-	r.players[conn] = &Player{
-		conn:    conn,
-		side:    side,
-		writeMu: sync.Mutex{},
-	}
-
+	player := newPlayer(conn, side)
+	r.players[conn] = player
+	r.game.join(side)
 	if len(r.players) == 2 {
-		r.resetMatchLocked()
-		r.started = true
+		r.game.start()
 	}
-	return r.players[conn], true
+	return player, r.game.snapshot(), true
 }
 
 func (r *Room) Remove(conn *websocket.Conn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	delete(r.players, conn)
-	r.started = false
-	r.resetMatchLocked()
-}
-
-func (r *Room) Snapshot() protocol.State {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return r.snapshotLocked()
-}
-
-func (r *Room) Move(conn *websocket.Conn, direction string) (protocol.State, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	player, ok := r.players[conn]
 	if !ok {
-		return protocol.State{}, false
+		return
 	}
-
-	if !r.started || r.gameOver {
-		return r.snapshotLocked(), true
-	}
-
-	switch player.side {
-	case protocol.SideLeft:
-		r.leftY = nextPaddleY(r.leftY, direction)
-	case protocol.SideRight:
-		r.rightY = nextPaddleY(r.rightY, direction)
-	default:
-		return protocol.State{}, false
-	}
-
-	return r.snapshotLocked(), true
+	player.close()
+	delete(r.players, conn)
+	r.game.stop()
 }
 
-func nextPaddleY(y int, direction string) int {
-	nextY := y
-
-	switch direction {
-	case protocol.DirectionUp:
-		nextY = y - 1
-	case protocol.DirectionDown:
-		nextY = y + 1
-	case protocol.DirectionStop:
-		nextY = y
-	}
-
-	if nextY < 1 {
-		return 1
-	}
-	if nextY > fieldHeight-paddleHeight-1 {
-		return fieldHeight - paddleHeight - 1
-	}
-
-	return nextY
-}
-
-func (r *Room) Broadcast(msg protocol.Message) {
-	r.mu.Lock()
-	players := slices.Collect(maps.Values(r.players))
-	r.mu.Unlock()
-
-	for _, player := range players {
-		if err := player.WriteJSON(msg); err != nil {
-			log.Printf("ERROR: player.WriteJSON(msg): %v\n", err)
-		}
-	}
-}
-
-func (r *Room) Step() protocol.State {
+func (r *Room) SetPaddle(player *Player, y, v float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	if !r.started || r.gameOver {
-		return r.snapshotLocked()
-	}
-
-	nextX := r.ballX + r.ballDX
-	nextY := r.ballY + r.ballDY
-
-	if nextY < 1 || nextY > fieldHeight-2 {
-		r.ballDY *= -1
-		nextY = r.ballY + r.ballDY
-	}
-	r.ballY = nextY
-
-	if r.ballDX < 0 && nextX == 1 && r.ballY >= r.leftY && r.ballY < r.leftY+paddleHeight {
-		r.ballDX *= -1
-		nextX = r.ballX + r.ballDX
-	}
-	if r.ballDX > 0 && nextX == fieldWidth-2 && r.ballY >= r.rightY && r.ballY < r.rightY+paddleHeight {
-		r.ballDX *= -1
-		nextX = r.ballX + r.ballDX
-	}
-
-	if nextX < 1 {
-		r.rightScore += 1
-		r.resetBall(1)
-		if r.rightScore >= winningScore {
-			r.gameOver = true
-			r.winner = "right"
-		}
-		return r.snapshotLocked()
-	} else if nextX > fieldWidth-2 {
-		r.leftScore += 1
-		r.resetBall(-1)
-		if r.leftScore >= winningScore {
-			r.gameOver = true
-			r.winner = "left"
-		}
-		return r.snapshotLocked()
-	}
-
-	r.ballX = nextX
-	return r.snapshotLocked()
+	r.game.setPaddle(player.side, y, v)
 }
 
+func (r *Room) Rematch(player *Player) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.game.requestRematch(player.side)
+}
+
+// Pong answers a clock-sync ping. The reply carries the server clock that game
+// snapshots are stamped with.
+func (r *Room) Pong(player *Player, clientTime float64) {
+	player.pushControl(protocol.Message{
+		Type:       protocol.MessagePong,
+		ClientTime: clientTime,
+		ServerTime: time.Since(r.started).Seconds(),
+	})
+}
+
+// Run drives the fixed-step simulation. Ticks are counted against the real
+// clock, so game speed stays exact however the OS timer happens to fire.
 func (r *Room) Run() {
-	ticker := time.NewTicker(frameInterval)
+	ticker := time.NewTicker(time.Second / sim.TickRate)
 	defer ticker.Stop()
 
+	ticksPerSnapshot := uint64(sim.TickRate / sim.SnapshotRate)
+	var done uint64
 	for range ticker.C {
-		state := r.Step()
-		r.Broadcast(protocol.Message{
-			Type:  protocol.MessageState,
-			State: &state,
-		})
-	}
-}
+		due := uint64(time.Since(r.started).Seconds() * sim.TickRate)
+		if due <= done {
+			continue
+		}
+		if due-done > maxCatchUp {
+			done = due - maxCatchUp
+		}
 
-func (r *Room) resetBall(direction int) {
-	r.ballX = fieldWidth / 2
-	r.ballY = fieldHeight / 2
-	r.ballDX = direction
-	r.ballDY = 1
-}
-
-func (r *Room) resetMatchLocked() {
-	r.leftScore, r.rightScore = 0, 0
-	r.gameOver = false
-	r.winner = ""
-	r.leftY, r.rightY = (fieldHeight-paddleHeight)/2, (fieldHeight-paddleHeight)/2
-	r.resetBall(1)
-}
-
-func (r *Room) snapshotLocked() protocol.State {
-	return protocol.State{
-		LeftY:      r.leftY,
-		RightY:     r.rightY,
-		BallX:      r.ballX,
-		BallY:      r.ballY,
-		LeftScore:  r.leftScore,
-		RightScore: r.rightScore,
-		GameOver:   r.gameOver,
-		Winner:     r.winner,
-		Started:    r.started,
+		r.mu.Lock()
+		// The clock keeps following real time even if ticks were skipped.
+		r.game.time = float64(done) * tickSeconds
+		send := false
+		for done < due {
+			r.game.step()
+			done++
+			send = send || done%ticksPerSnapshot == 0
+		}
+		if send {
+			state := r.game.snapshot()
+			for _, player := range r.players {
+				player.pushState(state)
+			}
+		}
+		r.mu.Unlock()
 	}
 }
